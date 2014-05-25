@@ -1,16 +1,19 @@
+
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
-#include <typeinfo>
+#include <tr1/functional>
 #include "semant.h"
+#include <algorithm>
 #include "utilities.h"
 
+#define DBGLINE if(semant_debug) cout << __FILE__ << ":" << __LINE__ << endl;
 
 extern int semant_debug;
 extern char *curr_filename;
 
-//#define DDD
-
+ClassTable* clsTablePtr = NULL;
 //////////////////////////////////////////////////////////////////////
 //
 // Symbols
@@ -83,49 +86,12 @@ static void initialize_constants(void)
 }
 
 
-/* Least common object in the tree. */
-Symbol TreeNode::lub(TreeNode *root, Symbol t1, Symbol t2)
-{
 
-                if (!t1)
-                        return t2;
-                TreeNode *t1node;
-                TreeNode *t2node;
+ClassTable::ClassTable(Classes classes) : semant_errors(0) , error_stream(cerr) {
 
-                if (comp_two_type(t1, Object) || comp_two_type(t2, Object))
-                        return Object;
-
-                t1node = root->get(this, t1);
-                do {
-                        t2node = t1node->get(this, t2);
-                        t1node = root->get(this, t1node->parent);
-                } while ( t2node == NULL
-                          && ((t1node = root->get(this, t1node->parent)) != NULL));
-
-                if (t1node == NULL)
-                        return NULL;
-                else
-                        return t1node->node_name;
-        }
-
-
-// Clases -> Classes_class -> list_node<Class_> --> Class__class : public tree_node:tree.h
-
-
-ClassTable::ClassTable(Classes classes) : semant_errors(0) , error_stream(cerr), _root(classes) {
-    _globalmap = new GlobalSymbolTable();
-    classTreeRoot = new TreeNode(Object, NULL);
-    _globalmap->enterscope();
-//    install_basic_classes();
-    first_pass();
-    second_pass();
-
-    if (_globalmap->lookup(Main) == NULL) {
-        error_stream << "Class Main is not defined.\n";
-        semant_error();
-    }
-    
-    _globalmap->exitscope();
+    /* Fill this in */
+    m_classList = classes;
+    install_basic_classes();
 }
 
 void ClassTable::install_basic_classes() {
@@ -162,6 +128,7 @@ void ClassTable::install_basic_classes() {
 			       single_Features(method(copy, nil_Formals(), SELF_TYPE, no_expr()))),
 	       filename);
 
+    m_classList = append_Classes(m_classList, single_Classes(Object_class));
     // 
     // The IO class inherits from Object. Its methods are
     //        out_string(Str) : SELF_TYPE       writes a string to the output
@@ -183,6 +150,8 @@ void ClassTable::install_basic_classes() {
 			       single_Features(method(in_int, nil_Formals(), Int, no_expr()))),
 	       filename);  
 
+    m_classList = append_Classes(m_classList, single_Classes(IO_class));
+
     //
     // The Int class has no methods and only a single attribute, the
     // "val" for the integer. 
@@ -193,11 +162,14 @@ void ClassTable::install_basic_classes() {
 	       single_Features(attr(val, prim_slot, no_expr())),
 	       filename);
 
+    m_classList = append_Classes(m_classList, single_Classes(Int_class));
+
     //
     // Bool also has only the "val" slot.
     //
     Class_ Bool_class =
 	class_(Bool, Object, single_Features(attr(val, prim_slot, no_expr())),filename);
+    m_classList = append_Classes(m_classList, single_Classes(Bool_class));
 
     //
     // The class Str has a number of slots and operations:
@@ -228,28 +200,448 @@ void ClassTable::install_basic_classes() {
 						      no_expr()))),
 	       filename);
 
-    int ret;
-    ret = classTreeRoot->addchild(Str, Object);
-    ret |= classTreeRoot->addchild(Bool, Object);
-    ret |= classTreeRoot->addchild(Int, Object);
-    ret |= classTreeRoot->addchild(IO, Object);
+    m_classList = append_Classes(m_classList, single_Classes(Str_class));
 
-    access_class(Object_class);
-    access_class(Bool_class);
-    access_class(IO_class);
-    access_class(Int_class);
-    access_class(Str_class);
+    if (semant_debug)
+        cout << "classes list: " << m_classList->len() << endl;
+}
+
+
+//helper class to report errors by symbol name
+Class_ ClassTable::find_class_by_name(Symbol name){
+    Class_ c;
+    for(int i = 0; i < m_classList->len(); i++){
+        c = m_classList->nth(i);
+        class__class* cls = static_cast<class__class*>(c);
+        if (cls->get_name() == name){
+            return c;
+        }
+    }
+    return 0;
+}
+
+bool ClassTable::do_check(){
+    return check_class_relations() && check_types();
+}
+
+
+namespace{
+    bool isVisited(const ClassVisitInfo& info){
+        return info.visit > 0;
+    }
+
+    bool beginsWith(const ClassNameList& ancestors, const Symbol& name){
+        return *(ancestors.begin()) == name;
+    }
+}
+
+bool ClassTable::check_class_relations() {
+    if (semant_debug)
+        cout << "checking inheritence..." << endl;
+    //check for inheritance graph
+    ClassVisitInfo info;
+    for (int i = 0; i < m_classList->len(); i++) {
+        class__class* cls = static_cast<class__class*>(m_classList->nth(i));
+        if (cls->get_name() == SELF_TYPE){
+            semant_error(cls) << endl;
+            continue;
+        }
+        info.name = cls->get_name();
+        info.parent = cls->get_parent(); 
+        info.visit = 0;
+        m_visitGraph.push_back(info);
+        m_classNameList.push_back(info.name);
+    }
+    if (semant_debug)
+        cout << "classes list size:" << m_visitGraph.size() << endl;
+
+    //check parent existence first because of dependency
+    for (VisitCIt it = m_visitGraph.begin(), itEnd = m_visitGraph.end();
+            it != itEnd; ++it){
+        const Symbol& parent = it->parent;
+        if (semant_debug)
+            cout << "Checking on " << it->name << endl;
+
+        // 1. It's an error to redefine basic classes
+        if ((it->name == Int) || (it->name == Bool) || (it->name == Str)
+                || (it->name == IO) || (it->name == Object)){
+            Class_ cls = find_class_by_name(it->name);
+            if (cls->get_filename() != stringtable.lookup_string("<basic class>")){
+                if (semant_debug)
+                    cout << "Redefined Int/Bool/String/IO/Object found!" << endl;
+                semant_error(find_class_by_name(it->name)) << "Redefinition of basic class " << it->name << ".\n";
+                return false;
+            }
+        }
+        // 2. It's an error to inherit from Int/Bool/String
+        if (parent == Int || parent == Bool || parent == Str){
+            if (semant_debug)
+                cout << "Inherit from builtin Int/Bool/String found!" << endl;
+            semant_error(find_class_by_name(it->name)) << "Class " << it->name
+                << " cannot inherit class " << parent << ".\n";
+            return false;
+        }
+        // 3. Parent class must be defined
+        if ((std::find(m_classNameList.begin(), m_classNameList.end(), parent) == \
+                m_classNameList.end()) && (parent != No_class)){
+            if (semant_debug)
+                cout << "Parent class not existed!" << endl;
+            semant_error(find_class_by_name(it->name)) << "Class " << it->name 
+                << " inherits from an undefined class " << it->parent << ".\n";
+            return false;
+        }
+    }
+
+    if (semant_debug)
+        cout << "Parent check succeed!" << endl;
+
+    //class name should be unique
+    bool has_main = false;
+    for (size_t i = 0; i < m_classNameList.size(); ++i){
+        if (std::count(m_classNameList.begin(), m_classNameList.end(), m_classNameList[i]) != 1){
+            if (semant_debug)
+                cout << "class name conflict!" << endl;
+            semant_error(find_class_by_name(m_classNameList[i])) << "Class " << m_classNameList[i] << " was previously defined.\n";
+            return false;
+        }
+        if (Main == m_classNameList[i]){
+            has_main = true;
+        }
+    }
+
+    //main class should be declared
+    if (!has_main){
+        semant_error() << "Class Main is not defined." << endl;
+    }
+
+    //check for cycles and record ancestors
+    size_t maxVisitLength = m_classNameList.size();
+    size_t depth = 0;
+    ClassVisitList nonVisited(m_visitGraph);
+    ClassNameList ancestors;
+
+    while (!nonVisited.empty()){
+        ancestors.clear();
+        depth = 1;
+        ClassVisitInfo& node = *(nonVisited.begin());
+        ancestors.push_back(node.name);
+
+        //Mark the node to exclude for next round
+        for (VisitIt it = m_visitGraph.begin(), itEnd = m_visitGraph.end();
+                it != itEnd; ++it){
+            if (it->name == node.name){
+                it->visit++;
+            }
+        }
+
+        while (node.parent != No_class){
+            ancestors.push_back(node.parent);
+            //parent existence is assured before
+            for (VisitIt it = m_visitGraph.begin(), itEnd = m_visitGraph.end();
+                it != itEnd; ++it){
+                if (it->name == node.parent){
+                    node = (*it);
+                    break;
+                }
+            }
+            depth++;
+
+            if (depth >= maxVisitLength){
+                //cycles detected!
+                semant_error(find_class_by_name(node.name));
+                if (semant_debug){
+                    cout << "cycle found! depth:" << depth << "maxLength:" << maxVisitLength << endl;
+                }
+                return false;
+            }
+        }
+
+        //If parent is not defined, default to object
+        if ((node.name != Object) && (node.parent == No_class)){
+            ancestors.push_back(Object); 
+        }
+        m_pathList.push_back(ancestors);
+
+        //Since a path is found, now re-count the nonvisited nodes
+        nonVisited.clear();
+        std::remove_copy_if(m_visitGraph.begin(), m_visitGraph.end(), std::back_inserter(nonVisited), isVisited);
+        //if (semant_debug){
+        //    cout << "After one round, visited depth = " << depth << ", remaining nodes = " << nonVisited.size() << endl;
+        //}
+    }
+
+    //build ancestors map
+    for(AncestorsPathList::iterator it = m_pathList.begin(), itEnd = m_pathList.end();
+            it != itEnd; ++it){
+        for (ClassNameList::iterator itNames = it->begin(), itNamesEnd = it->end(); 
+                itNames != itNamesEnd; ++itNames){
+            Symbol clsName = *itNames;
+            if (m_ancestorsTable.find(clsName) == m_ancestorsTable.end()){
+                //build one trace
+                AncestorsPathList::iterator itTrace = std::find_if(m_pathList.begin(), m_pathList.end(), 
+                        std::tr1::bind(&beginsWith, std::tr1::placeholders::_1, clsName));
+                if (itTrace != itEnd){
+                    m_ancestorsTable[clsName] = &(*itTrace);
+                }else{
+                    //Using the trace of this path, need to save the path first!
+                    size_t offset = std::distance(m_pathList.begin(), it);
+                    ClassNameList ancestors(itNames, itNamesEnd);
+                    m_pathList.push_back(ancestors);
+                    it = m_pathList.begin();
+                    std::advance(it, offset + 1);
+                    m_ancestorsTable[clsName] = &(*it);
+                }
+            }
+        }
+    }
+    if (semant_debug){
+        dump_ancestors_map();
+    }
+    return true;
+}
+
+Symbol ClassTable::get_lub(Symbol type1, Symbol type2){
+    if ( (m_ancestorsTable.find(type1) == m_ancestorsTable.end()) || (m_ancestorsTable.find(type2) 
+                == m_ancestorsTable.end())){
+        semant_error() << "Unknow type = " << type1 << endl;
+        return Object;
+    }
+
+    ClassNameList anc1 = *(m_ancestorsTable[type1]);
+    ClassNameList anc2 = *(m_ancestorsTable[type2]);
     
-//#define TREENODE_SELF_TEST
-#ifdef TREENODE_SELF_TEST
-    cout << "add result: " << ret << endl;
-    cout << "Str is Object subclass: " << classTreeRoot->isSubClass(Str, Object) << " expecting : True" << endl;
-    cout << "IO is Object subclass: " << classTreeRoot->isSubClass(IO, Object) << " expecting : True" << endl;
-    cout << "Object is IO subclass:" << classTreeRoot->isSubClass(Object, IO) << " expecting : False" << endl;
-    cout << "Str is IO subclass:" << classTreeRoot->isSubClass(Str, IO) << " expecting: False" << endl;
-#endif
-    
-    
+    if (semant_debug){
+        cout << "get_lub: ancestors for " << type1 << " -";
+        for (ClassNameList::iterator it = anc1.begin(), itEnd = anc1.end();
+                it != itEnd; ++it){
+            cout << (*it) << ",";
+        }
+        cout << endl;
+
+        cout << "get_lub: ancestors for " << type2 << " -";
+        for (ClassNameList::iterator it = anc2.begin(), itEnd = anc2.end();
+                it != itEnd; ++it){
+            cout << (*it) << ",";
+        }
+        cout << endl;
+    }
+
+    for(ClassNameList::iterator it1 = anc1.begin(), it1End = anc1.end();
+            it1 != it1End; ++it1){
+        if (std::count(anc2.begin(), anc2.end(), *it1) != 0){
+            return *it1;
+        }
+    }
+    return Object;
+}
+
+bool ClassTable::isSuperTypeOf(Symbol type1, Symbol type2){
+    if (m_ancestorsTable.find(type2) != m_ancestorsTable.end()){
+        ClassNameList& ancestors = *(m_ancestorsTable[type2]);
+        return std::count(ancestors.begin(), ancestors.end(), type1) == 1;
+    }
+    return false;
+}
+
+bool ClassTable::check_types(){
+    return check_feature_declarations() && check_feature_overrides() \
+        && check_feature_implementations();
+}
+
+bool ClassTable::check_feature_declarations(){
+    bool ret = true;
+    //traverse the ASTs and check types
+    for (int i = m_classList->first(); m_classList->more(i); i = m_classList->next(i)){
+        class__class* cls = dynamic_cast<class__class*>(m_classList->nth(i));
+        if (!cls){
+            return false;
+        }
+
+        m_symTable.enterscope();
+        m_symTable.addid(self, &SELF_TYPE);
+        m_symTable.addid(SELF_TYPE, new Symbol(cls->get_name()));
+        Features features = cls->get_features();
+        
+        //check method return types and param types first since they may be referenced in attributes
+        for (int j = features->first(); features->more(j);  j = features->next(j)){
+            Feature feature = features->nth(j);
+            if (feature->collect_type(m_symTable, cls->get_name())){
+                if (semant_debug)
+                    cout << "@@ Method return type checked for " << cls->get_name() << ":" << feature->get_name()
+                        << " is done" << endl;
+            }else{
+                semant_error(cls) << endl;
+                ret = false;
+            }
+        }
+        m_symTable.exitscope();
+
+        if (semant_debug){
+            cout << "All method declarations for class " << cls->get_name() << " CHECKED!" << endl << endl;
+            cout << "-----------------------------" << endl;
+        }
+    }
+    return ret;
+}
+
+
+bool ClassTable::check_feature_overrides(){
+    //scan the ancestors map and feature types table
+    for (AncestorsMap::iterator it = m_ancestorsTable.begin(), itEnd = m_ancestorsTable.end();
+            it != itEnd; ++it){
+
+        Symbol clsName = it->first;
+        SymbolList attrs; 
+        SymbolList methods; 
+        for (FeatureTypesMap::iterator it1 = m_featureTypeTable.begin(), it1End = m_featureTypeTable.end();
+                it1 != it1End; ++it1){
+            if (it1->first.first == clsName){
+                SymbolList& list = (it1->second.second) ? methods : attrs;
+                list.push_back(it1->first.second);
+            }
+        }
+
+        ClassNameList* ancestors = it->second;
+        for (ClassNameList::iterator it1 = ancestors->begin(), it1End = ancestors->end();
+                it1 != it1End; ++it1){
+            if (clsName == *it1){
+                continue; //actually always the first node
+            }else{
+                //Disallow attribute override
+                for (SymbolList::iterator it2 = attrs.begin(), it2End = attrs.end();
+                        it2 != it2End; ++it2){
+                    if (m_featureTypeTable.find(std::make_pair(*it1, *it2)) 
+                            != m_featureTypeTable.end()){
+                        //attribute redefinition is not allowd!
+                        if (semant_debug){
+                            cout << "attr redefined!" << endl;
+                            return false;
+                        }
+                        semant_error(find_class_by_name(clsName)) << endl;
+                    }
+                }
+                
+                //Check method override types
+                for (SymbolList::iterator it2 = methods.begin(), it2End = methods.end();
+                        it2 != it2End; ++it2){
+                    if (m_featureTypeTable.find(std::make_pair(*it1, *it2)) 
+                            != m_featureTypeTable.end()){
+                        //all the types must match
+                        ParamTypeList typesParent = m_featureTypeTable[std::make_pair(*it1, *it2)].first;
+                        ParamTypeList typesOwn    = m_featureTypeTable[std::make_pair(clsName, *it2)].first;
+                        if (typesParent.size() != typesOwn.size()){
+                            DBGLINE
+                            semant_error(find_class_by_name(clsName)) << endl;
+                            return false;
+                        }else{
+                            if (!std::equal(typesOwn.begin(), typesOwn.end(), typesParent.begin())){
+                                DBGLINE;
+                                semant_error(find_class_by_name(clsName)) << endl;
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+
+
+bool ClassTable::check_feature_implementations(){
+    //traverse the ASTs and check types
+    for (int i = m_classList->first(); m_classList->more(i); i = m_classList->next(i)){
+        class__class* cls = dynamic_cast<class__class*>(m_classList->nth(i));
+        if (!cls){
+            return false;
+        }
+
+        m_symTable.enterscope();
+        m_symTable.addid(self, &SELF_TYPE);
+        m_symTable.addid(SELF_TYPE, new Symbol(cls->get_name()));
+        Features features = cls->get_features();
+        
+        //check attributes first to find defined attributes
+        for (int j = features->first(); features->more(j);  j = features->next(j)){
+            Feature feature = features->nth(j);
+            attr_class* attr = dynamic_cast<attr_class*>(feature);
+            if (attr && !(attr->check_types(m_symTable))){
+                semant_error(cls) << endl;
+            }
+        }
+
+        //Now check method implementations
+        if ((cls->get_name() == Int) || (cls->get_name() == Bool) || (cls->get_name() == Str)
+                || (cls->get_name() == IO) || (cls->get_name() == Object)){
+            //don't check basic classes
+        }else{
+            //DO method check on user defined classes
+            for (int j = features->first(); features->more(j);  j = features->next(j)){
+                Feature feature = features->nth(j);
+                method_class* method = dynamic_cast<method_class*>(feature);
+                if (semant_debug){
+                    cout << "Do method type check on " << cls->get_name() << "::" << feature->get_name() << endl;
+                }
+                if (method){
+                    if (!method->check_types(m_symTable)){
+                        //Method type check error
+                        semant_error(cls) << endl; 
+                        //<< "Method Type check error for " << cls->get_name() << "::" << method->get_name() ;
+                    }
+                }
+            }
+        }
+
+        m_symTable.exitscope();
+
+        if (semant_debug)
+            cout << "Attrs and methods implementation for class " << cls->get_name() << " done" << endl;
+    }
+    return true;
+}
+
+
+bool ClassTable::is_inherited_feature(Symbol cls, Symbol method, Symbol& parent, bool isMethod){
+    if (m_ancestorsTable.find(cls) == m_ancestorsTable.end()){
+        if (semant_debug){
+            cout << "Ancestors for " << cls << " not built yet!" << endl;
+        }
+        return false;
+    }
+    ClassNameList* ancestors = m_ancestorsTable[cls];
+    if (!ancestors){
+        if (semant_debug){
+            cout << "Ancestors for " << cls << " is NULL!" << endl;
+        }
+        return false;
+    }else{
+        for (ClassNameList::iterator it = ancestors->begin(), itEnd = ancestors->end();
+                it != itEnd; ++it){
+            FeatureTypesMap::iterator itTypeMap = m_featureTypeTable.find(\
+                    std::make_pair(*it, method));
+            if ( (itTypeMap != m_featureTypeTable.end()) && (itTypeMap->second.second == isMethod)){
+                parent = *it;
+            }
+        }
+    }
+    return true;
+}
+
+
+void ClassTable::dump_ancestors_map(){
+    const char* preamble = "#### ";
+    for (AncestorsMap::iterator it = m_ancestorsTable.begin(), itEnd = m_ancestorsTable.end();
+            it != itEnd; ++it){
+        cout << preamble << setw(12) << it->first << " : ";
+        ClassNameList parents = *(it->second);
+        for (ClassNameList::iterator it1 = parents.begin(), it1End = parents.end();
+                it1 != it1End; ++it1){
+            cout << setw(8) << *it1 << "->";
+        }
+        cout << "ENDMARKER" << endl;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////
@@ -268,777 +660,9 @@ void ClassTable::install_basic_classes() {
 ///////////////////////////////////////////////////////////////////
 
 ostream& ClassTable::semant_error(Class_ c)
-{
-//    abort();
+{                                                             
     return semant_error(c->get_filename(),c);
-}
-
-ostream& ClassTable::semant_error(Class_ c, const char *errormsg)
-{
-    error_stream << c->get_filename() << ":"
-                 << c->get_line_number() << ": "
-                 << errormsg;
-
-    return semant_error();
-}
-
-ostream& ClassTable::semant_error_line(Class_ c) {
-    error_stream << c->get_filename() << ":"
-                 << c->get_line_number() << ": ";
-    return error_stream;
-}
-
-
-
-void ClassTable::access_attr(Class_ c,
-                             attr_class *attr, ClassSymbolTable *t) {
-    // Because this is a init, we should record the attr 's name and
-    // type in the type system.
-
-    if (pass == 1 && strcmp(attr->get_name()->get_string(), "self") == 0)
-        semant_error(c, "'self' cannot be the name of an attribute.\n");
-
-    if (pass == 1 && findSymbolToObject(dynamic_cast<class__class *>(c)->get_name(),
-                                        attr->get_name())) {
-            semant_error_line(c);
-            error_stream << "Attribute " << attr->get_name() << " is an attribute of an inherited class.\n";
-            semant_error();
-        }
-    
-    if (t->probe(attr->get_name()) != NULL) {
-        if (pass == 1)
-            semant_error(c);
-    } else {
-#ifdef DUMP_DECLEAR
-        cout << " Class: " << dynamic_cast<class__class *>(c)->get_name()
-             << "  declear attr: " << attr->get_name()
-             << "  type: " << attr->get_type_decl() << endl;
-#endif
-        Symbol type = attr->get_type_decl();
-        t->addid(attr->get_name(), type);
-        
-    }
-    if (!attr->get_init()->is_no_expr()) {
-        Symbol initType = access_expr(c, attr->get_init(), t);
-        if (initType == 0) {
-//            cout << "expr is null ? " << endl;
-            return;
-        }
-        if (!comp_two_type(initType, SELF_TYPE)
-            && !comp_two_type(initType, attr->get_type_decl())
-            && !classTreeRoot->isSubClass(initType,
-                                          attr->get_type_decl())) {
-            semant_error(c);
-        }
-    }
-}
-
-inline Symbol ClassTable::self_type_c(Class_ c) {
-    class__class *cc = dynamic_cast<class__class *>(c);
-    return cc->get_name();
-}
-
-inline int comp_two_type(Symbol a, Expression expr)
-{
-    if (expr->get_type() == NULL) {
-        cout << "compare with no_type..., symbol:" << a << endl;
-        return false;
-    }
-    return a->equal_string(expr->get_type()->get_string(), expr->get_type()->get_len());
-}
-
-
-Symbol ClassTable::findSymbolToObject(Symbol node, Symbol method_or_attr) {
-    // 1. get parent.
-    // 2. check if parent is Object
-    //  if it's null or object, return NULL.
-    // if not object, check whether this have such symbol
-    // if have , return it's type,
-    //
-    Symbol t = NULL;
-    if (node == NULL)
-        return NULL;
-
-//    cout << "find " << method_or_attr << " in " << node << endl;
-    ClassSymbolTable *table = _globalmap->lookup(node);
-    if (table)
-        t = table->lookup(method_or_attr);
-    if (t)
-        return t;
-        
-    TreeNode *p = classTreeRoot->get(classTreeRoot, node);
-    if (!p)
-        return NULL;
-    return (findSymbolToObject(p->get_parent(), method_or_attr));
-}
-
-Symbol ClassTable::access_dispatch_and_static(Class_ c, static_dispatch_class *static_c ,
-                                              dispatch_class *dis_c, ClassSymbolTable *t)
-{
-    Expressions es;
-    Symbol static_type = NULL;                 // Static type name for static dispatch.
-    Symbol call_object_type, call_object_type_copy;
-    Symbol body_return_type;
-    Expression  expr;
-    ClassSymbolTable *typetable;
-    Symbol function_ret = NULL;
-    Symbol curClassType = dynamic_cast<class__class *>(c)->get_name();
-    Symbol callableid = NULL;
-    Expression cure;
-
-    if (static_c) {
-        cure = static_c;
-        static_dispatch_class *ee = static_c;
-        es = ee->get_actual();
-        static_type = ee->get_type_name();
-        expr = ee->get_expr();
-        callableid = ee->get_name();
-    } else if (dis_c) {
-        cure = dis_c;
-        dispatch_class *ee = dis_c;
-        es = ee->get_actual();
-        expr = ee->get_expr();
-        callableid = ee->get_name();
-    }
-    
-    for (int i = es->first(); es->more(i); i = es->next(i)) {
-        body_return_type = access_expr(c, es->nth(i), t);
-    }
-
-    call_object_type = access_expr(c, expr, t);
-    call_object_type_copy = call_object_type;
-
-    if (comp_two_type(call_object_type, SELF_TYPE)) {
-        call_object_type = dynamic_cast<class__class *>(c)->get_name();
-    }
-
-    if (static_type) {
-        typetable = _globalmap->lookup(static_type);
-        function_ret = findSymbolToObject(static_type, callableid);
-    } else {
-        typetable = _globalmap->lookup(call_object_type);
-        function_ret = findSymbolToObject(call_object_type, callableid);
-    }
-
-    
-    if (comp_two_type(function_ret, SELF_TYPE)
-        && !comp_two_type(call_object_type_copy, SELF_TYPE))
-        function_ret = call_object_type;
-
-    if (function_ret == 0 && pass == 2) {
-
-        cout << "dispatch: cant find :"
-             << call_object_type << " . "
-             << callableid << " 's define" << endl; 
-        semant_error(c);
-        return Object;
-    }
-
-    cure->set_type(function_ret);
-    return function_ret;
-    
-}
-
-Symbol ClassTable::access_expr(Class_ c, Expression_class *e, ClassSymbolTable *t )
-{
-    // Assign.
-    if (typeid(*e) == typeid(assign_class)) {
-        assign_class *ee = dynamic_cast<assign_class *>(e);
-        if (ee == 0) {
-            cout << "error" << endl;
-        }
-
-        if (strcmp(ee->get_name()->get_string(), "self") == 0) {
-            if (pass == 1) {
-                semant_error_line(c) << "Cannot assign to 'self'.\n";
-                semant_error();
-            }
-            ee->set_type(Object);
-            return Object;
-        }
-        Symbol class_type = dynamic_cast<class__class *>(c)->get_name();
-        Symbol ty = findSymbolToObject(class_type, ee->get_name());
-        if (ty == NULL) {
-            if (pass == 2) {
-                // not found define.
-                error_stream << "not found define:" << ee->get_name() << endl;
-                semant_error(c);
-            }
-            ee->set_type(Object);
-            return Object;
-        } else {
-            // Needs access the expr first.
-            Symbol init_return_type = access_expr(c, ee->get_expr(), t);
-            if (comp_two_type(ty, init_return_type)) {
-                ee->set_type(init_return_type);
-                return init_return_type;
-            } else {
-                if (pass == 2) {
-                    error_stream << c->get_filename() << ":"
-                                 << c->get_line_number() << ": "
-                                 << "Type " << ee->get_expr()->get_type()
-                                 << " of assigned expression does not conform to declared type "
-                                 << ty <<" of identifier "
-                                 << ee->get_name() << "." << endl;
-                    semant_error();
-                    ee->set_type(Object);
-                }
-            }
-            return Object;
-        }
-    }
-
-    // Static dispatch and dispatch.
-    else if (typeid(*e) == typeid(static_dispatch_class)) {
-        static_dispatch_class *ee = dynamic_cast<static_dispatch_class *>(e);
-        return access_dispatch_and_static(c, ee, NULL, t);
-    } else if (typeid(*e) == typeid(dispatch_class)) {
-        dispatch_class *ee = dynamic_cast<dispatch_class *>(e);
-        return access_dispatch_and_static(c, NULL, ee, t);
-    }
-    // Cond
-    else if (typeid(*e) == typeid(cond_class)) {
-        cond_class *ee = dynamic_cast<cond_class *>(e);
-        Symbol tt = access_expr(c, ee->get_pred(), t);
-        if (pass == 2 && !comp_two_type(tt, Bool)) {
-            semant_error(c);
-            ee->set_type(Object);
-        }
-        Symbol t1 = access_expr(c, ee->get_then_exp(), t);
-        Symbol t2 = access_expr(c, ee->get_else_exp(), t);
-        Symbol tr = classTreeRoot->lub(classTreeRoot, t1, t2);
-        ee->set_type(tr);
-        return tr;
-    }
-    // Loop
-    else if (typeid(*e) == typeid(loop_class)) {
-        loop_class *ee = dynamic_cast<loop_class *>(e);
-        Expression pred = ee->get_pred();
-        Expression body = ee->get_body();
-        Symbol type = access_expr(c, pred, t);
-        if (pass == 2 && !comp_two_type(type, Bool)) {
-            semant_error(c);
-            ee->set_type(Object);
-        }
-        access_expr(c, body, t);
-        ee->set_type(Object);
-        return Object;
-    }
-    // typcase
-    else if (typeid(*e) == typeid(typcase_class)) {
-        typcase_class *ee = dynamic_cast<typcase_class *>(e);
-        Symbol t1 = access_expr(c, ee->get_expr(), t);
-        Cases cs = ee->get_cases();
-        Symbol type = NULL;
-        for (int i = cs->first(); cs->more(i); i = cs->next(i)) {
-            branch_class *eee = dynamic_cast<branch_class *>(cs->nth(i));
-            t->enterscope();
-            t->addid(eee->get_name(), eee->get_type_decl());
-            type = classTreeRoot->lub(classTreeRoot, type,
-                                       access_expr(c, eee->get_expr(), t));
-            t->exitscope();
-        }
-
-        e->set_type(type);
-        return type;
-    }
-    // block
-    else if (typeid(*e) == typeid(block_class)) {
-        Expressions es = dynamic_cast<block_class *>(e)->get_body();
-        Symbol type = NULL; 
-        t->enterscope();
-        for (int i = es->first(); es->more(i); i = es->next(i))
-            type = access_expr(c, es->nth(i), t);
-        t->exitscope();
-        e->set_type(type);
-        return type;
-    }
-    // Let
-    else if (typeid(*e) == typeid(let_class)) {
-        let_class *ee = dynamic_cast<let_class *>(e);
-        // SELF
-
-        if (strcmp(ee->get_identifier()->get_string(), "self") == 0) {
-            if (pass == 1) {
-                semant_error_line(c) << "'self' cannot be bound in a 'let' expression.\n";
-                semant_error();
-            }
-            return Object;
-        }
-            
-        Symbol t0 = ee->get_type_decl();
-        Symbol t1 = access_expr(c, ee->get_init(), t);
-
-        t->enterscope();
-        t->addid(ee->get_identifier(), t0);
-        
-        if (t1) {
-            if (!comp_two_type(t0, t1)) {
-                if (pass == 2) {
-                    semant_error_line(c) << "Inferred type "
-                                         << t1
-                                         <<  " of initialization of "
-                                         << ee->get_identifier()
-                                         << " does not conform to identifier's declared type "
-                                         << t0 << ".\n";
-                    semant_error();
-                    return Object;
-                }
-            }
-        }
-
-        Symbol rt = access_expr(c, ee->get_body(), t);
-
-        e->set_type(rt);
-
-        t->exitscope();
-        return rt;
-    }
-    // plus
-    // sub_class
-    // mul_class
-    // divide class
-    else if (typeid(*e) == typeid(plus_class)) {
-        plus_class *ee = dynamic_cast<plus_class *>(e);
-        Symbol t1 = access_expr(c, ee->get_e1(), t);
-        Symbol t2 = access_expr(c, ee->get_e2(), t);
-        // not same type, or not int is all error.
-        if (pass == 2
-            && (!comp_two_type(t1, t2)
-                || !comp_two_type(Int, t2))) {
-            semant_error_line(c) << "non-Int arguments: " << t1 << " + " << t2 << "\n";
-            semant_error();
-            e->set_type(Object);
-            return Object;
-        } else {
-            e->set_type(t1);
-            return t1;
-        }
-    } else if (typeid(*e) == typeid(sub_class)) {
-        sub_class *ee = dynamic_cast<sub_class *>(e);
-        Symbol t1 = access_expr(c, ee->get_e1(), t);
-        Symbol t2 = access_expr(c, ee->get_e2(), t);
-        // not same type, or not int is all error.
-        if (pass == 2
-            && (!comp_two_type(t1, t2)
-                || !comp_two_type(Int, t2))) {
-            semant_error(c);
-            e->set_type(Object);
-            return Object;
-        } else {
-            e->set_type(t1);
-            return t1;
-        }
-    }
-
-    else if (typeid(*e) == typeid(mul_class)) {
-        mul_class *ee = dynamic_cast<mul_class *>(e);
-        Symbol t1 = access_expr(c, ee->get_e1(), t);
-        Symbol t2 = access_expr(c, ee->get_e2(), t);
-        // not same type, or not int is all error.
-
-        if (pass == 2
-            && (!comp_two_type(t1, t2)
-                || !comp_two_type(Int, t2))) {
-            semant_error(c);
-            e->set_type(Object);
-            return Object;
-        } else {
-            e->set_type(Int);
-            return t1;
-        }
-    }
-
-    else if (typeid(*e) == typeid(divide_class)) {
-        divide_class *ee = dynamic_cast<divide_class *>(e);
-        Symbol t1 = access_expr(c, ee->get_e1(), t);
-        Symbol t2 = access_expr(c, ee->get_e2(), t);
-        // not same type, or not int is all error.
-
-        if (pass == 2
-            && (!comp_two_type(t1, t2)
-                || !comp_two_type(Int, t2))) {
-            semant_error(c);
-            e->set_type(Object);
-            return Object;
-        } else {
-            e->set_type(Int);
-            return t1;
-        }
-    }
-
-    
-    // neg class
-    else if (typeid(*e) == typeid(neg_class)) {
-        neg_class *ee = dynamic_cast<neg_class *>(e);
-        Symbol tt = access_expr(c, ee->get_e1(), t);
-        if (pass == 2 && !comp_two_type(Int, tt)) {
-            cout << "tt : " << tt <<endl;
-            semant_error(c);
-            e->set_type(Object);
-            return Object;
-        } else {
-            e->set_type(tt);
-            return tt;
-        }
-    }
-    // eq class
-    if( typeid(*e) == typeid(eq_class)) {
-        eq_class *ee = dynamic_cast<eq_class *>(e);
-        Symbol t1 = access_expr(c, ee->get_e1(), t);
-        Symbol t2 = access_expr(c, ee->get_e2(), t);
-
-        if (isInternalClassName(t2) || isInternalClassName(t1)) {
-            if (!comp_two_type(t1, t2)) {
-                semant_error_line(c);
-                error_stream << "Illegal comparison with a basic type.\n";
-                semant_error();
-                e->set_type(Bool);
-                return Bool;
-            }
-        }
-        
-        e->set_type(Bool);
-        return Bool;
-    }
-
-    // lt class
-    else if (typeid(*e) == typeid(lt_class)) {
-        lt_class *ee = dynamic_cast<lt_class *>(e);
-        if (ee) {
-            Symbol t1 = access_expr(c, ee->get_e1(), t);
-            Symbol t2 = access_expr(c, ee->get_e2(), t);
-            if (pass == 2 && (!comp_two_type(Int, t1)
-                              ||!comp_two_type(Int, t2))) {
-                semant_error(c);
-                e->set_type(Object);
-                return Object;
-            } else {
-                e->set_type(Bool);
-                return Bool;
-            }
-        }
-        // leq class
-    } else if (typeid(*e) == typeid(leq_class)) {
-        leq_class *ee = dynamic_cast<leq_class *>(e);
-        if (ee) {
-            Symbol t1 = access_expr(c, ee->get_e1(), t);
-            Symbol t2 = access_expr(c, ee->get_e2(), t);
-            if (pass == 2 && (!comp_two_type(Int, t1)
-                              ||!comp_two_type(Int, t2))) {
-                semant_error(c);
-                e->set_type(Object);
-                return Object;
-            } else {
-                e->set_type(Bool);
-                return Bool;
-            }
-        }
-    }
-    
-    // comp class
-    else if (typeid(*e) == typeid(comp_class)) {
-        comp_class *ee = dynamic_cast<comp_class *>(e);
-        Symbol tt = access_expr(c, ee->get_e1(), t);
-        if (pass == 2 && !comp_two_type(Bool, tt)) {
-            semant_error(c);
-            e->set_type(Object);
-            return Object;
-        } else {
-            e->set_type(Bool);
-            return Bool;
-        }
-    }
-    // int const class
-    else if (typeid(*e) == typeid(int_const_class)) {
-        e->set_type(Int);
-        return Int;
-    }
-    // bool const class
-    else if (typeid(*e) == typeid(bool_const_class)) {
-        e->set_type(Bool);
-        return Bool;
-    }
-    // string const class
-    else if (typeid(*e) == typeid(string_const_class)) {
-        e->set_type(Str);
-        return Str;
-    }
-    // new class
-    else if (typeid(*e) == typeid(new__class)) {
-        Symbol tt = dynamic_cast<new__class *>(e)->get_type_name();
-        if (!comp_two_type(tt, SELF_TYPE)
-            && _globalmap->lookup(tt) == NULL) {
-            if (pass == 2) {
-                semant_error_line(c) << "'new' used with undefined class "
-                                 << tt << endl;
-                semant_error();
-            }
-        }
-        e->set_type(tt);
-        return tt;
-    }
-    // isvoid class
-    else if (typeid(*e) == typeid(isvoid_class)) {
-        isvoid_class *ee = dynamic_cast<isvoid_class *>(e);
-        access_expr(c, ee->get_e1(), t);
-        e->set_type(Bool);
-        return Bool;
-    }
-    // no expr
-    // else if (typeid(*e) == typeid(no_expr_class)) {
-    //     return Object;
-    // }
-    // object class
-    else if (typeid(*e) == typeid(object_class)) {
-        object_class *ee = dynamic_cast<object_class *>(e);
-
-        if (comp_two_type(ee->get_name(), self)) {
-            e->set_type(SELF_TYPE);
-            return SELF_TYPE;
-        } else {
-            Symbol cls_name = dynamic_cast<class__class *>(c)->get_name();
-            Symbol type = findSymbolToObject(cls_name, ee->get_name());
-            if (pass == 2 && type == NULL) {
-
-                error_stream << c->get_filename() << ":"
-                             << c->get_line_number() << ": "
-                             << "Undeclared identifier "
-                             << ee->get_name()
-                             << "." << endl;
-                e->set_type(Object);
-                semant_error();
-                return Object;
-            }
-
-            e->set_type(type);
-            return type;
-        }
-    }
-
-
-//    cout << "Warnning: going to end of expr!!! e: " << typeid(*e).name() << endl;
-    return 0;
-}
-
-
-
-void ClassTable::access_method(Class_ c, method_class *m, ClassSymbolTable *t)
-{
-    currMethodST = new MethodSymbolTable();
-
-
-    // Add method to this type's symbol table.
-    t->addid(m->get_name(), m->get_return_type());
-#ifdef DDD
-    cout << "define class : " << dynamic_cast<class__class *>(c)->get_name() << " . " << m->get_name() << endl;
-#endif
-
-    if (!comp_two_type(m->get_return_type(), SELF_TYPE)) {
-        if (pass == 2)
-            if (!_globalmap->lookup(m->get_return_type())) {
-                semant_error_line(c) << "Undefined return type " << m->get_return_type()
-                                    << " in method " << m->get_name() << ".\n";
-                semant_error();
-            }
-    }
-
-    currMethodST->enterscope();
-
-    // process formals to init parameters.
-    if (m->get_formals()->len() != 0) {
-        Formals f = m->get_formals();
-        for (int i = f->first(); f->more(i); i = f->next(i)) {
-            formal_class *ff = dynamic_cast<formal_class *>(f->nth(i));
-            currMethodST->addid(ff->get_name(), ff->get_type_decl());
-            t->addid(ff->get_name(), ff->get_type_decl());
-        }
-    }
-    // Process the expr.
-    Symbol tt = access_expr(c, m->get_expr(), t);
-
-    if (tt != NULL && pass == 2) {
-        if (!comp_two_type(tt, SELF_TYPE)
-                 && !comp_two_type(tt, m->get_return_type())
-                 && !classTreeRoot->isSubClass(tt, m->get_return_type())) {
-
-            semant_error_line(c) << "Inferred return type " << tt
-                                 << " of method " << m->get_name()
-                                 << " does not conform to declared return type "
-                                 << m->get_return_type() << ".\n";
-            semant_error();
-
-            // Here means, the method 's caller must have such method's class...
-            // class a {
-            //        method();
-            //  }
-            //  (new a).method(),
-            // the ^^^^ must be a class a...
-            // cout << m->get_name() << " two type not equal or less: " << tt
-            //      << " return type: " << m->get_return_type() << endl;
-                // semant_error(c);
-                m->set_return_type(Object);
-        } 
-    }
-
-    m->set_return_type(m->get_return_type());
-    
-    currMethodST->exitscope();
-    delete currMethodST;
-}
-
-
-void ClassTable::access_features(Class_ c, Features fs, ClassSymbolTable *t)
-{
-
-    vector<method_class *> methods;
-    typedef vector<method_class *>::iterator VMI;
-    for (int i = fs->first(); fs->more(i); i = fs->next(i)) {
-        Feature_class * f = fs->nth(i);
-
-#ifdef DDD
-        cout << typeid(*f).name() << endl;
-#endif
-
-//        if (pass == 1)
-//            t->enterscope();
-        if (typeid(*f) == typeid(method_class)) {
-            methods.push_back(dynamic_cast<method_class *>(f));
-        } else if (typeid(*f) == typeid(attr_class)) {
-            access_attr(c, dynamic_cast<attr_class *>(f), t);
-        }
-//        if (pass == 2)
-//            t->exitscope();
-    }
-
-    for (VMI i = methods.begin(); i != methods.end(); i++)
-        access_method(c, *i, t);
-}
-
-bool ClassTable::isInternalClassName(Symbol a) {
-    return (strcmp(a->get_string(), "Object") == 0
-            || strcmp(a->get_string(), "Int") == 0
-            || strcmp(a->get_string(), "Bool") == 0
-            || strcmp(a->get_string(), "String") == 0);
-}
-
-bool ClassTable::invalidParentClassName(Symbol a) {
-    return (strcmp(a->get_string(), "Int") == 0
-            || strcmp(a->get_string(), "Bool") == 0
-            || strcmp(a->get_string(), "String") == 0);
-}
-
-
-void ClassTable::access_class(tree_node* node)
-{
-    if (typeid(*node) == typeid(class__class)) {
-
-        class__class *a = dynamic_cast<class__class *>(node);
-
-        // Create a symbol table for this class.
-        // If the class already exist, report an error.
-        if (pass == 1 && _globalmap->lookup(a->get_name()) != NULL) {
-            if (isInternalClassName(a->get_name())) {
-                semant_error_line(a);
-                error_stream << "Redefinition of basic class " << a->get_name() << ".\n";
-                semant_error();
-            } else {
-                semant_error_line(a)
-                    << "Class " << a->get_name() << " was previously defined.\n";
-                semant_error();
-            }
-        } else if (pass == 1) {
-            _globalmap->addid(a->get_name(), new ClassSymbolTable());
-        }
-
-        ClassSymbolTable *t = _globalmap->probe(a->get_name());
-        if (pass == 1)
-            t->enterscope();
-        access_features(a, a->get_features(), t);
-
-//        Not exit scope... orther wise, not find the method...
-//        if (pass == 2)
-//            t->exitscope();
-        
-#ifdef DDD
-        cout << "name: " << a->get_name() << " parent " << a->get_parent() << "features:" << a->get_features() << endl;
-#endif
-    }
-}
-
-void ClassTable::access_tree_node(Classes class_, ClassTable *classtable)
-{
-
-    typedef vector<Class__class *> vc;
-    vc failed_first;
-
-    if (pass == 1) {
-        for (int i = class_->first(); class_->more(i); i = class_->next(i)) {
-            Class_ node = class_->nth(i);
-            class__class *cc = dynamic_cast<class__class *>(node);
-            Symbol p = cc->get_parent() == NULL ? Object : cc->get_parent();
-
-#ifdef DDD
-            cout << "relation: class: " << cc->get_name() << " Parent: "
-                 << p << endl;
-#endif
-            if (!classTreeRoot->addchild(cc->get_name(), p)) {
-#ifdef DDD
-                cout << "class : " << cc->get_name() << " with parent: " << p
-                     << " failed to inherient" << endl;
-#endif
-                failed_first.push_back(cc);
-            }
-        }
-    }
-
-    install_basic_classes();
-
-    for (vc::iterator i = failed_first.begin(); i != failed_first.end(); i++) {
-        class__class *cc = dynamic_cast<class__class *>(*i);
-        Symbol p = cc->get_parent() == NULL ? Object : cc->get_parent();
-
-        // Check whether inherient from basic class.
-        if (pass == 1 &&
-            invalidParentClassName(cc->get_parent())) {
-            semant_error_line(cc) << "Class " << cc->get_name()
-                                  << " cannot inherit class "
-                                  << cc->get_parent() << ".\n";
-            semant_error();
-        }
-
-        if (pass == 1)  {
-            if (!classTreeRoot->get(classTreeRoot, cc->get_parent())) {
-                semant_error_line(cc) << "Class " << cc->get_name()
-                                      << " inherits from an undefined class "
-                                      << cc->get_parent() << ".\n";
-                semant_error();
-            }
-        }
-        
-        if (pass == 1 && !classTreeRoot->addchild(cc->get_name(), p)) {
-        }
-    }
-    
-    for (int i = class_->first(); class_->more(i); i = class_->next(i)) {
-        Class_ node = class_->nth(i);
-#ifdef DDD
-        cout << class_->nth(i) << endl;
-#endif
-        access_class(class_->nth(i));
-    }
-}
-
-void ClassTable::second_pass() {
-    pass = 2;
-    access_tree_node(_root, this);
-}
-void ClassTable::first_pass() {
-    pass = 1;
-    access_tree_node(_root, this);
-    return;
-}
-
+}    
 
 ostream& ClassTable::semant_error(Symbol filename, tree_node *t)
 {
@@ -1048,10 +672,10 @@ ostream& ClassTable::semant_error(Symbol filename, tree_node *t)
 
 ostream& ClassTable::semant_error()                  
 {                                                 
-    semant_errors++;
-//    abort();
+    semant_errors++;                            
     return error_stream;
 } 
+
 
 
 /*   This is the entry point to the semantic checker.
@@ -1067,18 +691,18 @@ ostream& ClassTable::semant_error()
      errors. Part 2) can be done in a second stage, when you want
      to build mycoolc.
  */
-
-
-
 void program_class::semant()
 {
     initialize_constants();
 
     /* ClassTable constructor may do some semantic analysis */
     ClassTable *classtable = new ClassTable(classes);
+    clsTablePtr = classtable;
 
     /* some semantic analysis code may go here */
-
+    if (semant_debug)
+        cout << "beginning to do check..." << endl;
+    classtable->do_check();
 
     if (classtable->errors()) {
 	cerr << "Compilation halted due to static semantic errors." << endl;
@@ -1086,4 +710,589 @@ void program_class::semant()
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+//cool-tree definitions
+bool assign_class::check_types(SymTable& symTable){
+    bool ret = true;
+    Symbol* type = symTable.lookup(name);
+    Symbol objType;
+
+    if (type == NULL){
+        Symbol parent;
+        if (clsTablePtr->is_inherited_feature(*symTable.lookup(SELF_TYPE), name, 
+                parent, false)){
+            ParamTypeList types = clsTablePtr->get_param_types(parent, name);
+            if (types.size() > 0){
+                objType = types[types.size() - 1];
+            }else{
+                DBGLINE
+                ret = false;
+            }
+        }else{
+            DBGLINE
+            ret = false;
+        }
+    }else{
+        objType = *type;
+    }
+
+    if (ret && (expr->check_types(symTable))){
+        Symbol expType = expr->get_type();
+        if (clsTablePtr->isSuperTypeOf(objType, expType)){
+            set_type(expr->get_type());
+            return true;
+        }else{
+            set_type(Object);
+            if (semant_debug){
+                cout << "Object type:" << objType << " is not super type of " << expType << endl;
+            }
+            DBGLINE
+            return false;
+        }
+    }
+    DBGLINE
+    return false;
+}
+
+bool static_dispatch_class::check_types(SymTable& symTable){
+    bool ret = expr->check_types(symTable);
+    if (ret){
+        Symbol t0 = expr->get_type();
+        ret = ret && clsTablePtr->isSuperTypeOf(type_name, t0);
+
+        //Return type check depends on formal return type of type_name::name
+        // If it's SELF_TYPE, set return type as expr's type
+        //  Otherwise, using the formal return type
+        ParamTypeList typeList = clsTablePtr->get_param_types(type_name, name);
+        if (typeList.size() == 0){
+            if (semant_debug)
+                cout << "$$$ static_dispatch: No types found for " << type_name << ":" << name << endl;
+            set_type(Object);
+            DBGLINE
+            return false;
+        }else{
+            Symbol retType = typeList[typeList.size() -1];
+            set_type(retType == SELF_TYPE ? t0 : retType);
+        }
+
+        //check all actual parameter types against formal params
+        size_t j = 0;
+        bool actTypeChecked = false;
+        for (int i = actual->first(); actual->more(i); i = actual->next(i)){
+            actTypeChecked = actual->nth(i)->check_types(symTable);
+            Symbol curType;
+            if ((j < typeList.size() - 1) && actTypeChecked){
+                curType = actual->nth(i)->get_type();
+                if (curType == SELF_TYPE){
+                    curType = *(symTable.lookup(SELF_TYPE));
+                }
+                if (clsTablePtr->isSuperTypeOf(typeList[j++], curType)){
+                    //fine
+                }else{
+                    if (semant_debug){
+                        cout << "Invalid type for parameter " << j << " as type:" << curType << endl;
+                    }
+                    DBGLINE
+                    ret = false;
+                }
+            }else{
+                DBGLINE
+                ret = false;
+            }
+            ret = ret && actTypeChecked;
+        }
+    }else{
+        DBGLINE
+        return false;
+    }
+    
+    return ret;
+}
+
+bool dispatch_class::check_types(SymTable& symTable){
+    bool ret = expr->check_types(symTable);
+    Symbol t0 = ret ? expr->get_type() : Object;
+    Symbol objType = t0;
+    if (t0 == SELF_TYPE){
+        objType = *(symTable.lookup(SELF_TYPE));
+    }
+
+    //Checking the actual class method signatures
+    ParamTypeList typeList = clsTablePtr->get_param_types(objType, name);
+    if (typeList.size() == 0){
+        if (semant_debug)
+            cout << "No types found for " << objType << ":" << name << endl;
+        set_type(Object);
+        DBGLINE
+        return false;
+    }
+
+    Symbol retType = typeList[typeList.size() -1];
+    if (!retType){
+        DBGLINE
+        ret = false;
+        if (semant_debug)
+            cout << "return type is not collected yet for " << t0 << ":" << name << endl;
+        set_type(No_type);
+    }else{
+        set_type(retType == SELF_TYPE ? t0 : retType);
+    }
+
+    //check all actual parameter types against formal params
+    size_t j = 0;
+    bool actTypeChecked = false;
+    for (int i = actual->first(); actual->more(i); i = actual->next(i)){
+        actTypeChecked = actual->nth(i)->check_types(symTable);
+        Symbol curType;
+        if ((j < typeList.size() - 1) && actTypeChecked){
+            curType = actual->nth(i)->get_type();
+            if (curType == SELF_TYPE){
+                curType = *(symTable.lookup(SELF_TYPE));
+            }
+            if (clsTablePtr->isSuperTypeOf(typeList[j++], curType)){
+                //fine
+            }else{
+                if (semant_debug){
+                    cout << "Invalid type for parameter " << j << " as type:" << curType << endl;
+                }
+                DBGLINE
+                ret = false;
+            }
+        }else{
+            DBGLINE
+            ret = false;
+        }
+        ret = ret && actTypeChecked;
+    }
+    if (!ret && semant_debug){
+        cout << name << " type check failed for object bound / actual parameters" << endl;
+    }
+    return ret;
+}
+
+bool cond_class::check_types(SymTable& symTable){
+    bool ret = true;
+    ret = ret && (pred->check_types(symTable));
+    if (!ret) DBGLINE
+    if ( ret && pred->get_type() == Bool){
+        ret = ret && then_exp->check_types(symTable);
+        ret = ret && else_exp->check_types(symTable);
+        Symbol t1 = then_exp->get_type();
+        Symbol t2 = else_exp->get_type();
+        Symbol selfType = *(symTable.lookup(SELF_TYPE));
+        t1 = ((t1 == SELF_TYPE) ? selfType : t1);
+        t2 = ((t2 == SELF_TYPE) ? selfType : t2);
+        if (t1 != t2){
+            set_type(clsTablePtr->get_lub(t1, t2));
+        }else{
+            set_type(t1);
+        }
+        if (semant_debug){
+            cout << "cond - then type:" << t1 << ", else type:" << t2
+                << ", cond type:" << get_type() << endl;
+        }
+    }else{
+        set_type(Object);
+    }
+    
+    return ret;
+}
+
+bool loop_class::check_types(SymTable& symTable){
+    set_type(Object);
+    if (! (pred->check_types(symTable))){
+        DBGLINE;
+        return false;
+    }
+
+    if (pred->get_type() != Bool){
+        if (semant_debug)
+            cout << " !!! loop predication is not bool, type = " << (pred->get_type()\
+                    ? pred->get_type() : No_type) << endl;
+        return false;
+    }
+
+    if (!(body->check_types(symTable))){
+        DBGLINE
+        return false;
+    }
+    return true;
+}
+
+bool typcase_class::check_types(SymTable& symTable){
+    bool ret = expr->check_types(symTable);
+    bool branchCheck = true;
+    ClassNameList typeList;
+    ClassNameList declTypeList;
+
+    for (int i = cases->first(); cases->more(i); i = cases->next(i)){
+        branchCheck = (cases->nth(i)->check_types(symTable));
+        ret = ret && branchCheck;
+
+        //decltype can't be duplicated
+        Symbol declType = cases->nth(i)->get_decltype();
+        Symbol retType = cases->nth(i)->get_type();
+        if (semant_debug){
+            cout << "$$$ branch decl type:" << declType << ", ret: " << retType << endl;
+        }
+        if (std::find(declTypeList.begin(), declTypeList.end(), declType) 
+                == declTypeList.end()){
+            declTypeList.push_back(declType);
+            if (branchCheck){
+                typeList.push_back(retType);
+            }else{
+                DBGLINE
+                ret = false;
+            }
+        }else{
+            if (semant_debug)
+                cout << "!!! Duplicated case type " << declType << " found in case branches"
+                     << " in class " << *(symTable.lookup(SELF_TYPE)) << endl;
+            ret = false;
+        }
+    }
+
+    if (typeList.empty()){
+        if (semant_debug){
+            cout << "No case statement type collected!" << endl;
+        }
+        set_type(Object);
+    }else{
+        //return lub of all the cases types
+        if (typeList.size() == 1){
+            set_type(typeList[0]);
+        }else{
+            Symbol lub_type = typeList[0];
+            ClassNameList::iterator it = typeList.begin() + 1;
+            for (ClassNameList::iterator itEnd = typeList.end(); it != itEnd; ++it){
+                Symbol clsType = *(symTable.lookup(SELF_TYPE));
+                if (lub_type == SELF_TYPE){
+                    lub_type = clsType;
+                }
+                if (lub_type == (*it)){
+                    continue;
+                }
+                lub_type = clsTablePtr->get_lub(lub_type, (*it) == SELF_TYPE ? clsType : (*it) );
+            }
+            set_type(lub_type);
+        }
+    }
+    return ret;
+}
+
+
+bool branch_class::check_types(SymTable& symTable){
+    symTable.enterscope();
+    symTable.addid(name, &type_decl);
+    bool ret = expr->check_types(symTable);   
+    symTable.exitscope();
+
+    set_type(ret ? expr->get_type() : Object);
+    return ret;
+}
+
+
+bool block_class::check_types(SymTable& symTable){
+    bool ret = true;
+    for (int i = body->first(); body->more(i); i = body->next(i)){
+        if (!(body->nth(i)->check_types(symTable))){
+            ret = false;
+            DBGLINE
+        }
+    }
+    set_type(body->nth(body->len() - 1)->get_type());
+    return ret;
+}
+
+
+bool let_class::check_types(SymTable& symTable){
+    init->check_types(symTable);
+    bool ret = true;
+
+    //check identifier type
+    if (identifier == self){
+        DBGLINE
+        ret = false;
+    }
+
+    //init type checking shall conform to identifier type
+    Symbol initType = init->get_type();
+    if (initType != No_type){
+        Symbol identifierType = type_decl;
+        if (type_decl == SELF_TYPE){
+            identifierType = *symTable.lookup(SELF_TYPE);
+        }
+
+        if (initType == SELF_TYPE){
+            initType = *symTable.lookup(SELF_TYPE);
+        }
+        if (!(clsTablePtr->isSuperTypeOf(identifierType, initType))){
+            DBGLINE
+            ret = false;
+        }
+    }
+
+    symTable.enterscope();
+    symTable.addid(identifier, &type_decl);
+    if (!(body->check_types(symTable))){
+        DBGLINE
+        ret = false;
+    }
+
+    symTable.exitscope();
+    set_type(body->get_type());
+    //cout << "let type is:" << body->get_type() << endl;
+    return ret;
+}
+
+
+bool plus_class::check_types(SymTable& symTable){
+    bool ret = e1->check_types(symTable);
+    ret = ret && e2->check_types(symTable);
+    if ( (e1->get_type() != Int) || (e2->get_type() != Int)){
+        set_type(Int);
+        return false;
+    }else{
+        set_type(Int);
+    }
+    return ret;
+}
+
+bool sub_class::check_types(SymTable& symTable){
+    bool ret = e1->check_types(symTable);
+    ret = ret && e2->check_types(symTable);
+    if ( (e1->get_type() != Int) || (e2->get_type() != Int)){
+        set_type(Int);
+        DBGLINE
+        return false;
+    }else{
+        set_type(Int);
+    }
+    return ret;
+}
+
+bool mul_class::check_types(SymTable& symTable){
+    bool ret = e1->check_types(symTable);
+    ret = ret && e2->check_types(symTable);
+    if ( (e1->get_type() != Int) || (e2->get_type() != Int)){
+        set_type(Int);
+        return false;
+    }else{
+        set_type(Int);
+    }
+    return ret;
+}
+
+bool divide_class::check_types(SymTable& symTable){
+    bool ret = e1->check_types(symTable);
+    ret = ret && e2->check_types(symTable);
+    if ( (e1->get_type() != Int) || (e2->get_type() != Int)){
+        set_type(Int);
+        return false;
+    }else{
+        set_type(Int);
+    }
+    return ret;
+}
+
+bool neg_class::check_types(SymTable& symTable){
+    if ((e1->check_types(symTable)) && e1->get_type() && (e1->get_type() != Int)){
+        if (semant_debug){
+            cout << "Assigning type " << e1->get_type() << " to Int" << endl;
+        }
+        set_type(Object);
+        return false;
+    }else{
+        set_type(Int);
+    }
+    return true;
+}
+
+bool lt_class::check_types(SymTable& symTable){
+    bool ret = e1->check_types(symTable);
+    if (!ret) DBGLINE
+    ret = e2->check_types(symTable) && ret;
+    if (!ret) DBGLINE
+    set_type(Bool);
+
+    if ( (e1->get_type() != Int) || (e2->get_type() != Int)){
+        DBGLINE
+        return false;
+    }
+    return ret;
+}
+
+bool eq_class::check_types(SymTable& symTable){
+    bool ret = e1->check_types(symTable);
+    ret = ret && e2->check_types(symTable);
+    set_type(Bool);
+
+    if (((e1->get_type() == Int) || (e1->get_type() == Bool) || (e1->get_type() == Bool) 
+            || (e2->get_type() == Int) || (e2->get_type() == Bool) || (e2->get_type() == Bool))){
+            ret = ret && (e1->get_type() == e2->get_type());
+    }else{
+        return ret;
+    }
+    if (!ret) DBGLINE
+    //cout << "equal check returns " << ret << endl;
+    return ret;
+}
+
+bool leq_class::check_types(SymTable& symTable){
+    DBGLINE
+    bool ret = e1->check_types(symTable);
+    ret = ret && e2->check_types(symTable);
+    set_type(Bool);
+
+    if ( (e1->get_type() != Int) || (e2->get_type() != Int))
+        return false;
+    return ret;
+}
+
+bool comp_class::check_types(SymTable& symTable){
+    bool ret = e1->check_types(symTable);
+    set_type(e1->get_type());
+    return ret;
+}
+
+bool int_const_class::check_types(SymTable& symTable){
+    set_type(Int);
+    return true;
+}
+
+bool bool_const_class::check_types(SymTable& symTable){
+    set_type(Bool);
+    return true;
+}
+
+bool string_const_class::check_types(SymTable& symTable){
+    set_type(Str);
+    return true;
+}
+
+bool new__class::check_types(SymTable& symTable){
+    //set_type((type_name == SELF_TYPE) ? *(symTable.lookup(SELF_TYPE)) : type_name);
+    set_type(type_name);
+    return true;
+}
+
+bool isvoid_class::check_types(SymTable& symTable){
+    set_type(Bool);
+    if (! (e1->check_types(symTable))){
+        return false;
+    }
+    return true;
+}
+
+bool no_expr_class::check_types(SymTable& symTable){
+    set_type(No_type);
+    return true;
+}
+
+bool object_class::check_types(SymTable& symTable){
+    Symbol* sym =  symTable.lookup(name);
+    if (sym){
+        set_type(*sym);
+    }else{
+        //check if it's defined in parent attribute list
+        Symbol parent;
+        if (clsTablePtr->is_inherited_feature(*symTable.lookup(SELF_TYPE), name, 
+                parent, false)){
+            ParamTypeList types = clsTablePtr->get_param_types(parent, name);
+            if (types.size() > 0){
+                set_type(types[types.size() - 1]);
+                return true;
+            }else{
+                set_type(Object);
+                DBGLINE
+                return false;
+            }
+        }else{
+            DBGLINE
+            return false;
+        }
+    }
+    return true;
+}
+
+bool method_class::collect_type(SymTable& table, Symbol clsName){
+    //save formal types
+    ClassNameList nameList;
+    for (int i = formals->first(); formals->more(i); i = formals->next(i)){
+        Symbol type = formals->nth(i)->get_type();
+        if (type == SELF_TYPE){
+            if (semant_debug)
+                cout << "SELF_TYPE in formal name in " << clsName << ":" << name << endl;
+            return false;
+        }
+
+        Symbol curName = formals->nth(i)->get_name();
+        if (curName == self){
+            if (semant_debug)
+                cout << "Self in formal name in " << clsName << ":" << name << endl;
+            return false;
+        }
+        else if (std::find(nameList.begin(), nameList.end(), curName) == nameList.end()){
+            clsTablePtr->collect_param_type(clsName, name, type);
+            nameList.push_back(curName);
+        }else{
+            if (semant_debug)
+                cout << "Duplicated formal name " << curName << " in " << clsName << ":" << name << endl;
+            return false;
+        }
+    }
+    //if (semant_debug)
+    //    cout << "@@@@ return type for " << clsName << ":" << name 
+    //        << " is " << return_type << endl;
+    clsTablePtr->collect_param_type(clsName, name, return_type);
+    return true;
+}
+
+
+bool method_class::check_types(SymTable& symTable){
+    symTable.enterscope();
+    //bind formal parameters into scope
+    for (int i = formals->first(); formals->more(i); i = formals->next(i)){
+        symTable.addid(formals->nth(i)->get_name(), new Symbol(formals->nth(i)->get_type()));
+    }
+    bool ret = expr->check_types(symTable);
+    symTable.exitscope();
+    if (!ret && semant_debug){
+        cout << "****** Errors found in method body of - " << *(symTable.lookup(SELF_TYPE)) 
+             << ":" << name << endl;
+    }else{
+        Symbol actType = expr->get_type();
+        //cout << "Act return type = " << actType << endl;
+        if (actType == No_type){
+            ret = false;
+        }else if(actType == SELF_TYPE){
+            actType = *(symTable.lookup(SELF_TYPE));
+        }
+        else if (!(clsTablePtr->isSuperTypeOf(return_type, actType))){
+            if (semant_debug){
+                cout << "Method " << name << " Actual return type " << actType << " is not sub type of " 
+                    << return_type << endl;
+            }
+            ret = false;
+        }
+    }
+    return ret;
+}
+
+bool attr_class::collect_type(SymTable& table, Symbol clsName){
+    clsTablePtr->collect_param_type(clsName, name, type_decl, false);
+    return true;
+}
+
+
+bool attr_class::check_types(SymTable& symTable){
+    if (semant_debug)
+        cout << "found definition of attr = " << name << endl;
+    if (name == self){
+        init->check_types(symTable);
+        return false;
+    }
+    symTable.addid(name, &type_decl);
+    return init->check_types(symTable);
+}
 

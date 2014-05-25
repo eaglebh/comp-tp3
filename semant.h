@@ -3,14 +3,13 @@
 
 #include <assert.h>
 #include <iostream>  
+#include <vector>  
+#include <tr1/unordered_map>  
+#include <map>  
 #include "cool-tree.h"
 #include "stringtab.h"
 #include "symtab.h"
 #include "list.h"
-#include <vector>
-
-using std::vector;
-
 
 #define TRUE 1
 #define FALSE 0
@@ -23,165 +22,104 @@ typedef ClassTable *ClassTableP;
 // you like: it is only here to provide a container for the supplied
 // methods.
 
-inline int comp_two_type(Symbol a, Symbol b)
-{
-    if (a == NULL || b == NULL)
-        return false;
 
-    return a->equal_string(b->get_string(), b->get_len());
-}
+typedef struct ClassVisitInfo{
+    Symbol name;
+    Symbol parent;
+    int    visit;
 
-
-class TreeNode;
-
-class TreeNode {
-private:
-        Symbol node_name;
-        Symbol parent;
-        vector<TreeNode *> *sibling;
-        TreeNode() {}
-public:
-        typedef vector<TreeNode *>::iterator VSI;
-        Symbol lub(TreeNode *root, Symbol t1, Symbol t2);
-        TreeNode(Symbol name, Symbol pparent) {
-                node_name = name;
-                sibling = new vector<TreeNode *>();
-                parent = pparent;
-#ifdef DDD                
-                cout << "create node: " << name;
-                if (parent)
-                        cout << " parent : " << parent;
-                cout << endl;
-#endif
+    ClassVisitInfo():name(0), parent(0), visit(0) {}
+    ClassVisitInfo(const ClassVisitInfo& ref) : name(ref.name), parent(ref.parent), visit(ref.visit){}
+    ClassVisitInfo& operator= (const ClassVisitInfo& ref){
+        if (&ref != this){
+            name = ref.name;
+            parent = ref.parent;
+            visit = ref.visit;
         }
-        virtual ~TreeNode() {
-#ifdef DDD
-                cout <<  "deleting ndoe: " << node_name << endl;
-#endif
-                delete sibling;
-        }
+        return *this;
+    }
+}ClassVisitInfo;
 
-        bool same_name(Symbol a) { return comp_two_type(a, node_name); }
+typedef std::vector<ClassVisitInfo> ClassVisitList;
+typedef ClassVisitList::iterator VisitIt;
+typedef ClassVisitList::const_iterator VisitCIt;
 
-        TreeNode *get(TreeNode *n, Symbol a) {
+typedef std::vector<Symbol> ClassNameList;
+typedef ClassNameList SymbolList;
+typedef std::vector<ClassNameList> AncestorsPathList;
+typedef std::tr1::unordered_map<Symbol, ClassNameList*> AncestorsMap;
 
-                if (comp_two_type(n->node_name, a)) {
-                        return n;
-                }
-                for (VSI i = n->sibling->begin();
-                     i != n->sibling->end();
-                     ++i) {
-                        TreeNode *nn = get(*i, a);
-                        if (nn != NULL) {
-                                return nn;
-                        }
-                }
-                return NULL;
-        }
+typedef ClassNameList ParamTypeList;
+typedef std::pair<ParamTypeList, bool> FeatureTypesValue;
+typedef std::pair<Symbol, Symbol> DeclKey; //key as <clsName, method_name>
+typedef std::map<DeclKey, FeatureTypesValue> FeatureTypesMap;
 
-        void dump_sibling() {
-                for (VSI i = sibling->begin(); i != sibling->end(); i++)
-                        cout << "  sib: " << (*i)->node_name << endl;
-                
-        }
-
-        void dump_tree() {
-                cout << " \t\t " << node_name;
-                if (parent)
-                        cout << " parent : " << parent;
-                cout << "\n";
-                for (VSI i = sibling->begin(); i != sibling->end(); i++) {
-                        cout << "  sib: " << (*i)->node_name << endl;
-                        (*i)->dump_tree();
-                }
-        }
-
-        bool addchild(Symbol name, Symbol parent) {
-                TreeNode *p = get(this, parent);
-                if (p == NULL) {
-                        return false;
-                }
-                TreeNode *n = get(this, name);
-                if (n != NULL) {
-                        return false;
-                }
-                p->sibling->push_back(new TreeNode(name, parent));
-                return true;
-        }
-
-        /* Return if class A is a subclass of class B */
-        bool isSubClass(Symbol a, Symbol b) {
-                TreeNode *n = get(this, b);
-                if (n == NULL) {
-                        return false;
-                }
-                TreeNode *n2 = get(n, a);
-                return n2 != NULL;
-        }
-
-
-        Symbol get_parent() {
-                return parent;
-        }
-
-        Symbol get_node_name() {
-                return node_name;
-        }
-};
-
-
-typedef SymbolTable<Symbol, Entry> ClassSymbolTable;
+typedef SymbolTable<Symbol, Symbol> SymTable;
 
 class ClassTable {
 private:
   int semant_errors;
-  int pass;
   void install_basic_classes();
   ostream& error_stream;
-  Classes _root;
-  TreeNode *classTreeRoot;
-  typedef Symbol Type;
 
-  /* Symbol table for current method. */
-  typedef SymbolTable<Symbol, Entry> MethodSymbolTable;
-  MethodSymbolTable *currMethodST;
-  
-  /* Symbol table for each of classes. */
+  ClassVisitList    m_visitGraph;
+  Classes           m_classList;
+  ClassNameList     m_classNameList;
+  AncestorsPathList m_pathList; 
+  AncestorsMap      m_ancestorsTable;
+  FeatureTypesMap   m_featureTypeTable;
+  SymTable          m_symTable;
 
-  /* Symbol table for the global classes. */
-  typedef SymbolTable<Symbol, ClassSymbolTable> GlobalSymbolTable;
+  //check for inheritance graph
+  bool check_class_relations();
+  bool check_types();
 
-  GlobalSymbolTable *_globalmap;
+  bool check_feature_declarations();
+  bool check_feature_overrides();
+  bool check_feature_implementations();
+
+  //get class by name
+  Class_ find_class_by_name(Symbol name);
+
+  //dump
+  void dump_ancestors_map();
 
 public:
   ClassTable(Classes);
-  int errors() { return semant_errors; }
 
-  Symbol findSymbolToObject(Symbol node, Symbol method_or_attr);
-  bool isInternalClassName(Symbol a);
-  bool invalidParentClassName(Symbol a);
-  Symbol access_dispatch_and_static(Class_ c,
-                                    static_dispatch_class *static_c,
-                                    dispatch_class *dis_c, ClassSymbolTable *t);
-  Symbol self_type_c(Class_ c);
-  Symbol access_expr(Class_ c, Expression_class *e, ClassSymbolTable *t );
-  void access_method(Class_ c, method_class *m, ClassSymbolTable *t);
-  void access_attr(Class_ c, attr_class *attr, ClassSymbolTable *t);
-  void access_features(Class_ c, Features fs, ClassSymbolTable *t);
-  void access_tree_node(Classes class_, ClassTable *classtable);
-  
-  void access_class(tree_node *);
-  void first_pass();
-  void second_pass();
-  
-  
+  bool do_check();
+
+  //check and get least upper bound type
+  Symbol get_lub(Symbol type1, Symbol type2);
+  bool isSuperTypeOf(Symbol type1, Symbol type2);
+
+  //collect formals
+  void collect_param_type(Symbol cls, Symbol method, Symbol type, bool isMethod = true){
+      m_featureTypeTable[std::make_pair(cls, method)].first.push_back(type);
+      m_featureTypeTable[std::make_pair(cls, method)].second = isMethod;
+  }
+
+  ParamTypeList get_param_types(Symbol cls, Symbol method){
+      if (m_featureTypeTable.find(std::make_pair(cls, method)) != m_featureTypeTable.end()){
+          return m_featureTypeTable[std::make_pair(cls, method)].first;
+      }else{
+          //check for ancestors
+          Symbol parent;
+          if (is_inherited_feature(cls, method, parent)){
+              return m_featureTypeTable[std::make_pair(parent, method)].first;
+          }else{
+              return ParamTypeList();
+          }
+      }
+  }
+
+  bool is_inherited_feature(Symbol cls, Symbol name, Symbol& parent, bool isMethod = true);
+
+  int errors() { return semant_errors; }
   ostream& semant_error();
   ostream& semant_error(Class_ c);
-  ostream& semant_error(Class_ c, const char *errormsg);
-  ostream& semant_error_line(Class_ c);
   ostream& semant_error(Symbol filename, tree_node *t);
 };
-
 
 #endif
 
