@@ -1,1 +1,1 @@
-/home/prof/renato/cool/student/src/PA4/symtab_example.cc
+student/src/PA4/symtab_example.cc

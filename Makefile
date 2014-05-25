@@ -1,1 +1,1 @@
-/home/prof/renato/cool/student/etc/../assignments/PA4/Makefile
+student/etc/../assignments/PA4/Makefile

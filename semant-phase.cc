@@ -1,1 +1,1 @@
-/home/prof/renato/cool/student/src/PA4/semant-phase.cc
+student/src/PA4/semant-phase.cc

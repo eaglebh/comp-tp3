@@ -1,1 +1,1 @@
-/home/prof/renato/cool/student/src/PA4/dumptype.cc
+student/src/PA4/dumptype.cc

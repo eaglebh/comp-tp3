@@ -1,1 +1,1 @@
-/home/prof/renato/cool/student/src/PA4/cool-tree.cc
+student/src/PA4/cool-tree.cc
