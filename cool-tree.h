@@ -11,7 +11,9 @@
 
 #include "tree.h"
 #include "cool-tree.handcode.h"
+#include "symtab.h"
 
+typedef SymbolTable<Symbol, Symbol> SymTable;
 
 // define the class for phylum
 // define simple phylum - Program
@@ -50,24 +52,16 @@ public:
    tree_node *copy()		 { return copy_Feature(); }
    virtual Feature copy_Feature() = 0;
 
+   virtual Symbol get_name() = 0;
+   virtual bool collect_type(SymTable& table, Symbol clsName) = 0;
+   virtual bool check_types(SymTable& symTable) = 0;
 #ifdef Feature_EXTRAS
    Feature_EXTRAS
 #endif
 };
 
 
-// define simple phylum - Formal
-typedef class Formal_class *Formal;
-
-class Formal_class : public tree_node {
-public:
-   tree_node *copy()		 { return copy_Formal(); }
-   virtual Formal copy_Formal() = 0;
-
-#ifdef Formal_EXTRAS
-   Formal_EXTRAS
-#endif
-};
+;
 
 
 // define simple phylum - Expression
@@ -78,6 +72,7 @@ public:
    tree_node *copy()		 { return copy_Expression(); }
    virtual Expression copy_Expression() = 0;
 
+   virtual bool check_types(SymTable& symTable) = 0;
 #ifdef Expression_EXTRAS
    Expression_EXTRAS
 #endif
@@ -88,9 +83,16 @@ public:
 typedef class Case_class *Case;
 
 class Case_class : public tree_node {
+    Symbol type;
 public:
    tree_node *copy()		 { return copy_Case(); }
    virtual Case copy_Case() = 0;
+   virtual bool check_types(SymTable& symTable) = 0;
+
+   Symbol get_type() {return type;}
+   void set_type(Symbol t) { type = t;}
+
+   virtual Symbol get_decltype() = 0;
 
 #ifdef Case_EXTRAS
    Case_EXTRAS
@@ -162,6 +164,10 @@ public:
    Class_ copy_Class_();
    void dump(ostream& stream, int n);
 
+   Symbol get_name() { return name;}
+   Symbol get_parent() { return parent;}
+   Features get_features() { return features;}
+
 #ifdef Class__SHARED_EXTRAS
    Class__SHARED_EXTRAS
 #endif
@@ -188,13 +194,68 @@ public:
    Feature copy_Feature();
    void dump(ostream& stream, int n);
 
+   Symbol get_returnType(){
+       return return_type;
+   }
+   virtual Symbol get_name(){return name;}
+   virtual bool collect_type(SymTable& table, Symbol clsName);
+   virtual bool check_types(SymTable& symTable);
+
 #ifdef Feature_SHARED_EXTRAS
    Feature_SHARED_EXTRAS
+#endif
+#ifdef attr_EXTRAS
+   attr_EXTRAS
 #endif
 #ifdef method_EXTRAS
    method_EXTRAS
 #endif
 };
+
+
+// define simple phylum - Formal
+typedef class Formal_class *Formal;
+
+class Formal_class : public tree_node {
+public:
+   tree_node *copy()		 { return copy_Formal(); }
+   virtual Formal copy_Formal() = 0;
+   virtual Symbol get_type() = 0;
+   virtual Symbol get_name() = 0;
+
+#ifdef Formal_EXTRAS
+   Formal_EXTRAS
+#endif
+};
+
+
+
+// define the class for phylum - LIST
+// define list phlyum - Classes
+typedef list_node<Class_> Classes_class;
+typedef Classes_class *Classes;
+
+
+// define list phlyum - Features
+typedef list_node<Feature> Features_class;
+typedef Features_class *Features;
+
+
+// define list phlyum - Formals
+typedef list_node<Formal> Formals_class;
+typedef Formals_class *Formals;
+
+
+// define list phlyum - Expressions
+typedef list_node<Expression> Expressions_class;
+typedef Expressions_class *Expressions;
+
+
+// define list phlyum - Cases
+typedef list_node<Case> Cases_class;
+typedef Cases_class *Cases;
+
+
 
 
 // define constructor - attr
@@ -211,6 +272,10 @@ public:
    }
    Feature copy_Feature();
    void dump(ostream& stream, int n);
+
+   virtual Symbol get_name(){return name;}
+   virtual bool check_types(SymTable& symTable);
+   virtual bool collect_type(SymTable& table, Symbol clsName);
 
 #ifdef Feature_SHARED_EXTRAS
    Feature_SHARED_EXTRAS
@@ -233,6 +298,10 @@ public:
    }
    Formal copy_Formal();
    void dump(ostream& stream, int n);
+
+   virtual Symbol get_type(){return type_decl;}
+   virtual Symbol get_name(){return name;}
+
 
 #ifdef Formal_SHARED_EXTRAS
    Formal_SHARED_EXTRAS
@@ -257,6 +326,8 @@ public:
    }
    Case copy_Case();
    void dump(ostream& stream, int n);
+   virtual bool check_types(SymTable& symTable);
+   virtual Symbol get_decltype(){return type_decl;}
 
 #ifdef Case_SHARED_EXTRAS
    Case_SHARED_EXTRAS
@@ -269,6 +340,7 @@ public:
 
 // define constructor - assign
 class assign_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Symbol name;
    Expression expr;
@@ -291,6 +363,7 @@ public:
 
 // define constructor - static_dispatch
 class static_dispatch_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression expr;
    Symbol type_name;
@@ -317,6 +390,7 @@ public:
 
 // define constructor - dispatch
 class dispatch_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression expr;
    Symbol name;
@@ -341,6 +415,7 @@ public:
 
 // define constructor - cond
 class cond_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression pred;
    Expression then_exp;
@@ -365,6 +440,7 @@ public:
 
 // define constructor - loop
 class loop_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression pred;
    Expression body;
@@ -387,6 +463,7 @@ public:
 
 // define constructor - typcase
 class typcase_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression expr;
    Cases cases;
@@ -409,6 +486,7 @@ public:
 
 // define constructor - block
 class block_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expressions body;
 public:
@@ -429,6 +507,7 @@ public:
 
 // define constructor - let
 class let_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Symbol identifier;
    Symbol type_decl;
@@ -455,6 +534,7 @@ public:
 
 // define constructor - plus
 class plus_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression e1;
    Expression e2;
@@ -477,6 +557,7 @@ public:
 
 // define constructor - sub
 class sub_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression e1;
    Expression e2;
@@ -499,6 +580,7 @@ public:
 
 // define constructor - mul
 class mul_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression e1;
    Expression e2;
@@ -521,6 +603,7 @@ public:
 
 // define constructor - divide
 class divide_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression e1;
    Expression e2;
@@ -543,6 +626,7 @@ public:
 
 // define constructor - neg
 class neg_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression e1;
 public:
@@ -563,6 +647,7 @@ public:
 
 // define constructor - lt
 class lt_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression e1;
    Expression e2;
@@ -585,6 +670,7 @@ public:
 
 // define constructor - eq
 class eq_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression e1;
    Expression e2;
@@ -607,6 +693,7 @@ public:
 
 // define constructor - leq
 class leq_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression e1;
    Expression e2;
@@ -629,6 +716,7 @@ public:
 
 // define constructor - comp
 class comp_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression e1;
 public:
@@ -649,6 +737,7 @@ public:
 
 // define constructor - int_const
 class int_const_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Symbol token;
 public:
@@ -669,6 +758,7 @@ public:
 
 // define constructor - bool_const
 class bool_const_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Boolean val;
 public:
@@ -689,6 +779,7 @@ public:
 
 // define constructor - string_const
 class string_const_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Symbol token;
 public:
@@ -709,6 +800,7 @@ public:
 
 // define constructor - new_
 class new__class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Symbol type_name;
 public:
@@ -729,6 +821,7 @@ public:
 
 // define constructor - isvoid
 class isvoid_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Expression e1;
 public:
@@ -749,6 +842,7 @@ public:
 
 // define constructor - no_expr
 class no_expr_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
 public:
    no_expr_class() {
@@ -767,6 +861,7 @@ public:
 
 // define constructor - object
 class object_class : public Expression_class {
+   virtual bool check_types(SymTable& symTable);
 protected:
    Symbol name;
 public:
